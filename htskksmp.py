@@ -31,8 +31,12 @@ COL_AMOUNT = "total_amount"
 # ---------------------------------------------------------
 
 def clean_jan(jan_val):
+    """JANコードのクリーニング（シングルクォート除去、数値化）"""
     s = str(jan_val).strip()
-    s = s.lstrip("'")
+    # Excel特有の '49... 形式や "49..." 形式を除去
+    s = re.sub(r"^['\"]", "", s)
+    s = re.sub(r"['\"]$", "", s)
+    # 小数点以下(.0)の削除
     s = re.sub(r'\.0$', '', s)
     return s
 
@@ -63,45 +67,50 @@ def parse_date_str(date_str, default_year=None):
     except: pass
     return None
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """カラム名の表記ゆれを統一する"""
-    col_map = {
-        '納品日': COL_DATE, '納品予定日': COL_DATE, '日付': COL_DATE,
-        '部門': COL_DEPT, '部門コード': COL_DEPT, '部門CD': COL_DEPT,
-        '商品コード': COL_JAN, 'JANコード': COL_JAN, 'JAN': COL_JAN, '商品CD': COL_JAN,
-        '商品名': COL_NAME, '品名': COL_NAME,
-        '発注数量': COL_QTY, '数量': COL_QTY, '発注数': COL_QTY,
-        '売単価': COL_PRICE, '単価': COL_PRICE, '原単価': COL_PRICE, '売価': COL_PRICE,
-        '発注区分': COL_PROMO, '販促': COL_PROMO, '特売': COL_PROMO
-    }
-    # カラム名を文字列にして空白削除してからマッピング確認
-    new_cols = {}
-    for c in df.columns:
-        c_str = str(c).strip()
-        if c_str in col_map:
-            new_cols[c] = col_map[c_str]
-    
-    return df.rename(columns=new_cols)
+# ---------------------------------------------------------
+# データ処理ロジック（柔軟性強化版）
+# ---------------------------------------------------------
 
-# ---------------------------------------------------------
-# データ処理ロジック
-# ---------------------------------------------------------
+def find_column(df_cols, candidates):
+    """カラム名の候補リストから、存在するものを探して返す"""
+    for c in candidates:
+        if c in df_cols:
+            return c
+    return None
 
 def process_format_1(df: pd.DataFrame) -> pd.DataFrame:
-    """ODR_RES形式 (トランザクション / 1行ヘッダー)"""
-    # カラム名を正規化して必須カラムがあるかチェック
-    df = normalize_columns(df)
+    """ODR_RES形式 (リスト形式 / 1行ヘッダー)"""
     
-    required_cols = {COL_DATE, COL_DEPT, COL_JAN}
-    if not required_cols.issubset(df.columns):
+    # カラム名のゆらぎ吸収マップ
+    # 左側：統一コードで使う名前、右側：CSVにある可能性のある名前リスト
+    col_mappings = {
+        COL_DATE: ['納品日', '納入日', '発注日', '日付'],
+        COL_DEPT: ['部門', '部門コード'],
+        COL_JAN: ['商品コード', 'JANコード', 'JAN', 'JanCode'],
+        COL_NAME: ['商品名', '商品名称', '品名'],
+        COL_QTY: ['発注数量', '数量', '数'],
+        COL_PRICE: ['売単価', '売価', '単価'],
+        COL_PROMO: ['発注区分', '販促', '特売区分']
+    }
+    
+    rename_dict = {}
+    for unified_name, candidates in col_mappings.items():
+        found = find_column(df.columns, candidates)
+        if found:
+            rename_dict[found] = unified_name
+    
+    # 必須カラムチェック（日付、JAN、部門）
+    if COL_DATE not in rename_dict.values() or COL_JAN not in rename_dict.values():
         return pd.DataFrame()
 
-    # 足りないカラムがあれば補完
-    if COL_NAME not in df.columns: df[COL_NAME] = ""
-    if COL_QTY not in df.columns: df[COL_QTY] = 0
-    if COL_PRICE not in df.columns: df[COL_PRICE] = 0
-    if COL_PROMO not in df.columns: df[COL_PROMO] = ""
+    df = df.rename(columns=rename_dict)
+    
+    # 存在しない任意カラムを補完
+    for c in [COL_DEPT, COL_NAME, COL_QTY, COL_PRICE, COL_PROMO]:
+        if c not in df.columns:
+            df[c] = "" if c == COL_PROMO else 0
 
+    # データ変換
     df[COL_DATE] = df[COL_DATE].apply(lambda x: parse_date_str(x))
     df[COL_DEPT] = df[COL_DEPT].apply(clean_dept)
     df[COL_JAN] = df[COL_JAN].apply(clean_jan)
@@ -117,6 +126,7 @@ def process_format_2_from_df(df: pd.DataFrame) -> pd.DataFrame:
     new_cols = []
     last_top = None
     
+    # カラムの正規化（Unnamed補完）
     for top, bottom in df.columns:
         if "Unnamed" not in str(top) and "週合計" not in str(top):
             last_top = top
@@ -128,34 +138,62 @@ def process_format_2_from_df(df: pd.DataFrame) -> pd.DataFrame:
     fixed_col_map = {}
     date_cols = []
     
+    # カラム解析
     for top, bottom in new_cols:
-        if "Unnamed" in str(bottom):
-            fixed_col_map[(top, bottom)] = top
+        s_bottom = str(bottom)
+        if "JAN" in s_bottom or "商品コード" in s_bottom:
+            fixed_col_map[(top, bottom)] = 'JANコード'
+        elif "部門" in s_bottom:
+            fixed_col_map[(top, bottom)] = '部門'
+        elif "商品名" in s_bottom:
+            fixed_col_map[(top, bottom)] = '商品名'
+        elif "Unnamed" in s_bottom:
+            pass # その他固定列
         elif top is not None and "週合計" not in str(top):
             if top not in date_cols: date_cols.append(top)
     
     records = []
     for _, row in df.iterrows():
-        base_info = {name: row[col_key] for col_key, name in fixed_col_map.items()}
-        jan = base_info.get('JANコード')
+        # 固定情報の抽出
+        jan_key = next((k for k, v in fixed_col_map.items() if v == 'JANコード'), None)
+        dept_key = next((k for k, v in fixed_col_map.items() if v == '部門'), None)
+        name_key = next((k for k, v in fixed_col_map.items() if v == '商品名'), None)
         
+        jan = row[jan_key] if jan_key else None
         if pd.isna(jan): continue
+        
+        dept = row[dept_key] if dept_key else "000"
+        name = row[name_key] if name_key else ""
 
         for date_str in date_cols:
             if not date_str or date_str == "nan": continue
             
-            qty = pd.to_numeric(row.get((date_str, '数量')), errors='coerce')
-            if pd.isna(qty): continue
+            # 日付列の値を取得（数量、売価、販促）
+            # カラム構造に依存するため、名称で検索
+            qty = 0
+            price = 0
+            promo_str = ""
             
-            price = pd.to_numeric(row.get((date_str, '売価')), errors='coerce')
-            promo_val = row.get((date_str, '販促'))
-            promo_str = str(promo_val) if not pd.isna(promo_val) else ""
+            # (日付, '数量') のようなペアを探す
+            try:
+                qty_val = row.get((date_str, '数量'))
+                if pd.isna(qty_val): qty_val = row.get((date_str, '発注数量'))
+                
+                # 数値変換できるかチェック
+                qty = pd.to_numeric(qty_val, errors='coerce')
+                if pd.isna(qty): continue # 数量がなければスキップ
+                
+                price = pd.to_numeric(row.get((date_str, '売価'), 0), errors='coerce')
+                promo_val = row.get((date_str, '販促'))
+                promo_str = str(promo_val) if not pd.isna(promo_val) else ""
+            except:
+                continue
             
             record = {
                 COL_DATE: parse_date_str(date_str),
-                COL_DEPT: clean_dept(base_info.get('部門', '000')),
+                COL_DEPT: clean_dept(dept),
                 COL_JAN: clean_jan(jan),
-                COL_NAME: base_info.get('商品名', ''),
+                COL_NAME: name,
                 COL_QTY: qty,
                 COL_PRICE: price,
                 COL_PROMO: promo_str
@@ -166,61 +204,60 @@ def process_format_2_from_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_data(uploaded_file) -> pd.DataFrame:
     """
-    【スマホ対応強化版】
-    ファイルを最初にメモリに完全展開してから解析することで、
-    モバイルブラウザ特有のファイルポインタ消失やストリームエラーを防ぐ
+    ロバストな読み込み関数
+    - 複数のエンコーディングを試行
+    - エラー行をスキップ
+    - 形式（リスト or マトリックス）を自動判定
     """
     if uploaded_file is None: return pd.DataFrame()
     
-    # 1. ファイルポインタを先頭に戻す (スマホ対応で必須)
-    uploaded_file.seek(0)
+    # 試行するエンコーディング順序 (BOM付きUTF-8を優先)
+    encodings = ['utf-8-sig', 'cp932', 'shift_jis', 'utf-8']
     
-    # 2. ファイルの中身を全てメモリ(bytes)に読み込む
-    try:
-        file_content = uploaded_file.read()
-    except Exception:
-        return pd.DataFrame()
-
-    # 3. 試行パターン定義
-    encodings = ['cp932', 'utf-8-sig', 'utf-8', 'shift_jis']
-    header_candidates = [0, 1, 2, 3, 4]
-
-    # 4. メモリ上のデータに対して総当たり解析
     for enc in encodings:
-        for header_row in header_candidates:
-            try:
-                # 毎回新しいBytesIOストリームを作成する（ポインタ干渉を防ぐため）
-                stream = BytesIO(file_content)
+        uploaded_file.seek(0)
+        try:
+            # まず先頭だけ読んで形式判定
+            # on_bad_lines='skip' で不正な行があっても読み込む
+            df_preview = pd.read_csv(uploaded_file, nrows=10, encoding=enc, on_bad_lines='skip', dtype=str)
+            cols_str = str(df_preview.columns)
+            
+            # 形式判定
+            is_format_1 = False
+            is_format_2 = False
+            
+            # Format 1 (リスト): 「納品日」または「発注日」があり、「商品コード」または「JAN」がある
+            if ("納品日" in cols_str or "発注日" in cols_str) and \
+               ("商品コード" in cols_str or "JAN" in cols_str):
+                is_format_1 = True
                 
-                # --- パターン1: 通常のCSV (Format 1) ---
-                try:
-                    df = pd.read_csv(stream, header=header_row, encoding=enc, encoding_errors='replace')
-                    temp_df = normalize_columns(df)
-                    # 必須カラムが含まれているかチェック
-                    if {COL_DATE, COL_DEPT, COL_JAN}.issubset(temp_df.columns):
-                        return process_format_1(df)
-                except Exception:
-                    pass 
+            # Format 2 (マトリックス): 「JANコード」と「部門」があり、データ部分が横に広がる
+            elif ("JAN" in cols_str or "商品コード" in cols_str) and "部門" in cols_str:
+                # Format 1と誤認しないよう、週合計などのキーワードもあればFormat 2優先
+                is_format_2 = True
+            
+            uploaded_file.seek(0)
+            
+            if is_format_1:
+                df = pd.read_csv(uploaded_file, encoding=enc, on_bad_lines='skip', dtype=str)
+                processed = process_format_1(df)
+                if not processed.empty: return processed
+                
+            elif is_format_2:
+                # マトリックスはヘッダーが2行の可能性が高い
+                df = pd.read_csv(uploaded_file, header=[0, 1], encoding=enc, on_bad_lines='skip', dtype=str)
+                processed = process_format_2_from_df(df)
+                if not processed.empty: return processed
+                
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            continue
 
-                # --- パターン2: マトリックスCSV (Format 2) ---
-                stream.seek(0) # ストリーム位置リセット
-                try:
-                    df_matrix = pd.read_csv(stream, header=[header_row, header_row+1], encoding=enc, encoding_errors='replace')
-                    cols_str = str(df_matrix.columns)
-                    if ("JAN" in cols_str or "商品" in cols_str) and ("部門" in cols_str):
-                        res = process_format_2_from_df(df_matrix)
-                        if not res.empty: return res
-                except Exception:
-                    pass
-
-            except Exception:
-                continue 
-
-    # 全パターン失敗
     return pd.DataFrame()
 
 # ---------------------------------------------------------
-# CSV生成・POP生成
+# CSV生成・POP生成（ロジック維持）
 # ---------------------------------------------------------
 
 def create_matrix_csv(df: pd.DataFrame) -> bytes:
@@ -331,7 +368,7 @@ def main():
     st.title("📦 発注データ集計アプリ")
 
     # ----------------------------------------
-    # LINEブラウザ対策の案内
+    # LINEブラウザ対策
     # ----------------------------------------
     st.markdown("""
     <style>
@@ -348,12 +385,12 @@ def main():
     <div class="line-warning">
         <h4>⚠️ LINEから開いている方へ</h4>
         <p><b>LINE内蔵ブラウザではアップロードが反応しない場合があります。</b><br>
-        反応しない場合は、右上のメニュー（︙または↗️）から「ブラウザで開く」を選択してください。</p>
+        反応しない場合は、他のブラウザで開いてください</p>
     </div>
     """, unsafe_allow_html=True)
 
     # ----------------------------------------
-    # 1. データ読込とフィルタ設定 (Expanderに集約)
+    # 1. データ読込とフィルタ設定 (Expander)
     # ----------------------------------------
     with st.expander("🛠️ データ読込・フィルタ設定", expanded=True):
         st.caption("Step 1: データのアップロード")
@@ -372,7 +409,7 @@ def main():
                     all_data.append(df)
                     st.success(f"OK: {f.name} ({len(df)}行)")
                 else:
-                    st.error(f"NG: {f.name} (読み込めませんでした)")
+                    st.error(f"NG: {f.name} (形式不明またはデータなし)")
 
         # データがある場合のみフィルタ項目を表示
         if all_data:
@@ -426,7 +463,7 @@ def main():
             
         else:
             st.info("まずはファイルをアップロードしてください👆")
-            st.stop() # データがない場合はここで処理を止める
+            st.stop() 
 
     # -------------------------------------------------
     # フィルタロジック適用
@@ -464,13 +501,11 @@ def main():
 
     st.subheader("📊 集計結果")
 
-    # メトリクス表示
     m1, m2, m3 = st.columns(3)
     m1.metric("合計金額", f"¥{agg_view[COL_AMOUNT].sum():,.0f}")
     m2.metric("総数量", f"{agg_view[COL_QTY].sum():,.0f}")
     m3.metric("アイテム", f"{len(agg_view)}品")
 
-    # データテーブル
     st.dataframe(
         agg_view,
         column_config={
@@ -483,7 +518,6 @@ def main():
         use_container_width=True, hide_index=True, height=300
     )
 
-    # ダウンロードボタンエリア
     st.markdown("---")
     st.subheader("📤 ダウンロード")
     
