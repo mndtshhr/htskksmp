@@ -129,10 +129,15 @@ def process_format_2_from_df(df: pd.DataFrame, year_hint=None) -> pd.DataFrame:
     last_top = None
     
     # マルチインデックスの整形 (Unnamedの補完)
+    # 上段ヘッダー(top)が結合セルで、Pandas読み込み時にUnnamedになっている箇所を埋める
     for top, bottom in df.columns:
-        if "Unnamed" not in str(top) and "週合計" not in str(top):
+        s_top = str(top)
+        # "Unnamed"が含まれておらず、かつ"週合計"のような集計列でない場合、それを現在の上段見出しとする
+        if "Unnamed" not in s_top and "週合計" not in s_top:
             last_top = top
-        final_top = last_top if "Unnamed" in str(top) else top
+        
+        # 上段がUnnamedなら、直前の有効な見出し(last_top)を使う
+        final_top = last_top if "Unnamed" in s_top else top
         new_cols.append((final_top, bottom))
     
     df.columns = pd.MultiIndex.from_tuples(new_cols)
@@ -140,20 +145,28 @@ def process_format_2_from_df(df: pd.DataFrame, year_hint=None) -> pd.DataFrame:
     fixed_col_map = {}
     date_cols = []
     
-    # カラム解析
+    # --- カラム解析 (修正箇所) ---
+    # TopとBottomの両方をチェックして、固定列（JAN、部門、商品名）を特定する
+    # 理由: 2行ヘッダーの場合、"部門"などのラベルはTopにあり、Bottomが"Unnamed"になることがあるため
     for top, bottom in new_cols:
         s_top = str(top)
         s_bottom = str(bottom)
         
-        # 固定列の判定
-        if "JAN" in s_bottom or "商品コード" in s_bottom:
+        # 判定用文字列（両方チェック）
+        # JANコード列の特定
+        if ("JAN" in s_top or "JAN" in s_bottom) or ("商品コード" in s_top or "商品コード" in s_bottom):
             fixed_col_map[(top, bottom)] = 'JANコード'
-        elif "部門" in s_bottom:
+        
+        # 部門列の特定
+        elif "部門" in s_top or "部門" in s_bottom:
             fixed_col_map[(top, bottom)] = '部門'
-        elif "商品名" in s_bottom:
+            
+        # 商品名列の特定
+        elif "商品名" in s_top or "商品名" in s_bottom:
             fixed_col_map[(top, bottom)] = '商品名'
         
         # 日付列の判定 (M/D 形式が含まれるか)
+        # 日付はTopヘッダーにある ("01/21(水)" など)
         elif top is not None and "週合計" not in s_top and re.search(r'\d{1,2}/\d{1,2}', s_top):
             if top not in date_cols: date_cols.append(top)
     
@@ -179,14 +192,16 @@ def process_format_2_from_df(df: pd.DataFrame, year_hint=None) -> pd.DataFrame:
 
             # マトリックスデータの取得
             try:
-                # 数量
+                # 数量 (Bottomヘッダーが"数量")
+                # カラムキーは (top=日付文字列, bottom="数量")
                 qty_val = row.get((date_str, '数量'))
-                if pd.isna(qty_val): continue
                 
+                # 数量が取得できない、またはNaN/0の場合はスキップ
+                if pd.isna(qty_val): continue
                 qty = pd.to_numeric(qty_val, errors='coerce')
                 if pd.isna(qty) or qty == 0: continue 
 
-                # 売価・販促
+                # 売価・販促 (Bottomヘッダーが"売価", "販促")
                 price = pd.to_numeric(row.get((date_str, '売価'), 0), errors='coerce')
                 promo_val = row.get((date_str, '販促'))
                 promo_str = str(promo_val) if not pd.isna(promo_val) else ""
@@ -269,6 +284,7 @@ def load_data(uploaded_file) -> pd.DataFrame:
                     year_hint = int(m_year.group(0))
                 
                 # ヘッダーは2行分として読み込む
+                # header=[Topの行, Bottomの行]
                 df = pd.read_csv(uploaded_file, header=[header_row_idx, header_row_idx+1], encoding=enc, on_bad_lines='skip', dtype=str)
                 processed = process_format_2_from_df(df, year_hint=year_hint)
                 if not processed.empty: return processed
