@@ -31,9 +31,9 @@ COL_AMOUNT = "total_amount"
 # ---------------------------------------------------------
 
 def clean_jan(jan_val):
-    """JANコードのクリーニング（シングルクォート除去、数値化）"""
+    """JANコードのクリーニング"""
     s = str(jan_val).strip()
-    # Excel特有の '49... 形式や "49..." 形式を除去
+    # Excel特有の '49... や "49..." を除去
     s = re.sub(r"^['\"]", "", s)
     s = re.sub(r"['\"]$", "", s)
     # 小数点以下(.0)の削除
@@ -52,23 +52,27 @@ def parse_date_str(date_str, default_year=None):
         
     s = str(date_str).strip()
     if not s or s.lower() == 'nan': return None
+    
     # 8桁数値 (YYYYMMDD)
     if re.match(r'^\d{8}$', s):
         try: return datetime.datetime.strptime(s, '%Y%m%d').date()
         except ValueError: pass
-    # M/D 形式
+        
+    # M/D 形式 (01/21, 1/21, 01/21(水) など)
+    # 括弧などの不要な文字を除去して先頭の M/D を取得
     m = re.match(r'(\d{1,2})/(\d{1,2})', s)
     if m:
         month, day = map(int, m.groups())
         try: return datetime.date(default_year, month, day)
         except ValueError: pass
+        
     # 標準形式
     try: return pd.to_datetime(s).date()
     except: pass
     return None
 
 # ---------------------------------------------------------
-# データ処理ロジック（柔軟性強化版）
+# データ処理ロジック
 # ---------------------------------------------------------
 
 def find_column(df_cols, candidates):
@@ -79,10 +83,8 @@ def find_column(df_cols, candidates):
     return None
 
 def process_format_1(df: pd.DataFrame) -> pd.DataFrame:
-    """ODR_RES形式 (リスト形式 / 1行ヘッダー)"""
+    """形式1: ODR_RES形式 (リスト形式 / 1行ヘッダー)"""
     
-    # カラム名のゆらぎ吸収マップ
-    # 左側：統一コードで使う名前、右側：CSVにある可能性のある名前リスト
     col_mappings = {
         COL_DATE: ['納品日', '納入日', '発注日', '日付'],
         COL_DEPT: ['部門', '部門コード'],
@@ -99,13 +101,13 @@ def process_format_1(df: pd.DataFrame) -> pd.DataFrame:
         if found:
             rename_dict[found] = unified_name
     
-    # 必須カラムチェック（日付、JAN、部門）
+    # 必須カラムチェック
     if COL_DATE not in rename_dict.values() or COL_JAN not in rename_dict.values():
         return pd.DataFrame()
 
     df = df.rename(columns=rename_dict)
     
-    # 存在しない任意カラムを補完
+    # 欠損カラム補完
     for c in [COL_DEPT, COL_NAME, COL_QTY, COL_PRICE, COL_PROMO]:
         if c not in df.columns:
             df[c] = "" if c == COL_PROMO else 0
@@ -121,12 +123,12 @@ def process_format_1(df: pd.DataFrame) -> pd.DataFrame:
     cols = [COL_DATE, COL_DEPT, COL_JAN, COL_NAME, COL_QTY, COL_PRICE, COL_PROMO]
     return df[cols].dropna(subset=[COL_DATE])
 
-def process_format_2_from_df(df: pd.DataFrame) -> pd.DataFrame:
-    """OrderCheckList形式 (マトリックス / 2行ヘッダー)"""
+def process_format_2_from_df(df: pd.DataFrame, year_hint=None) -> pd.DataFrame:
+    """形式2: OrderCheckList形式 (マトリックス / 2行ヘッダー)"""
     new_cols = []
     last_top = None
     
-    # カラムの正規化（Unnamed補完）
+    # マルチインデックスの整形 (Unnamedの補完)
     for top, bottom in df.columns:
         if "Unnamed" not in str(top) and "週合計" not in str(top):
             last_top = top
@@ -140,16 +142,19 @@ def process_format_2_from_df(df: pd.DataFrame) -> pd.DataFrame:
     
     # カラム解析
     for top, bottom in new_cols:
+        s_top = str(top)
         s_bottom = str(bottom)
+        
+        # 固定列の判定
         if "JAN" in s_bottom or "商品コード" in s_bottom:
             fixed_col_map[(top, bottom)] = 'JANコード'
         elif "部門" in s_bottom:
             fixed_col_map[(top, bottom)] = '部門'
         elif "商品名" in s_bottom:
             fixed_col_map[(top, bottom)] = '商品名'
-        elif "Unnamed" in s_bottom:
-            pass # その他固定列
-        elif top is not None and "週合計" not in str(top):
+        
+        # 日付列の判定 (M/D 形式が含まれるか)
+        elif top is not None and "週合計" not in s_top and re.search(r'\d{1,2}/\d{1,2}', s_top):
             if top not in date_cols: date_cols.append(top)
     
     records = []
@@ -168,37 +173,38 @@ def process_format_2_from_df(df: pd.DataFrame) -> pd.DataFrame:
         for date_str in date_cols:
             if not date_str or date_str == "nan": continue
             
-            # 日付列の値を取得（数量、売価、販促）
-            # カラム構造に依存するため、名称で検索
-            qty = 0
-            price = 0
-            promo_str = ""
-            
-            # (日付, '数量') のようなペアを探す
+            # 日付解析
+            date_obj = parse_date_str(date_str, default_year=year_hint)
+            if not date_obj: continue
+
+            # この日付の下にある「数量」「売価」「販促」を取得
+            # カラム名が ('01/21(水)', '数量') のようになっていると仮定
             try:
+                # 数量
                 qty_val = row.get((date_str, '数量'))
-                if pd.isna(qty_val): qty_val = row.get((date_str, '発注数量'))
+                # マトリックス形式では空欄は0または発注なしとみなす
+                if pd.isna(qty_val): continue
                 
-                # 数値変換できるかチェック
                 qty = pd.to_numeric(qty_val, errors='coerce')
-                if pd.isna(qty): continue # 数量がなければスキップ
-                
+                if pd.isna(qty) or qty == 0: continue # 0もスキップ設定（必要なら変更）
+
+                # 売価・販促
                 price = pd.to_numeric(row.get((date_str, '売価'), 0), errors='coerce')
                 promo_val = row.get((date_str, '販促'))
                 promo_str = str(promo_val) if not pd.isna(promo_val) else ""
+                
+                record = {
+                    COL_DATE: date_obj,
+                    COL_DEPT: clean_dept(dept),
+                    COL_JAN: clean_jan(jan),
+                    COL_NAME: name,
+                    COL_QTY: qty,
+                    COL_PRICE: price,
+                    COL_PROMO: promo_str
+                }
+                records.append(record)
             except:
                 continue
-            
-            record = {
-                COL_DATE: parse_date_str(date_str),
-                COL_DEPT: clean_dept(dept),
-                COL_JAN: clean_jan(jan),
-                COL_NAME: name,
-                COL_QTY: qty,
-                COL_PRICE: price,
-                COL_PROMO: promo_str
-            }
-            records.append(record)
             
     return pd.DataFrame(records)
 
@@ -206,58 +212,80 @@ def load_data(uploaded_file) -> pd.DataFrame:
     """
     ロバストな読み込み関数
     - 複数のエンコーディングを試行
-    - エラー行をスキップ
     - 形式（リスト or マトリックス）を自動判定
     """
     if uploaded_file is None: return pd.DataFrame()
     
-    # 試行するエンコーディング順序 (BOM付きUTF-8を優先)
-    encodings = ['utf-8-sig', 'cp932', 'shift_jis', 'utf-8']
+    encodings = ['utf-8-sig', 'utf-8', 'cp932', 'shift_jis']
     
     for enc in encodings:
         uploaded_file.seek(0)
         try:
-            # まず先頭だけ読んで形式判定
-            # on_bad_lines='skip' で不正な行があっても読み込む
-            df_preview = pd.read_csv(uploaded_file, nrows=10, encoding=enc, on_bad_lines='skip', dtype=str)
-            cols_str = str(df_preview.columns)
+            # 先頭の数行を読んで構造を解析
+            # on_bad_lines='skip' でパースエラーを無視してとにかく読む
+            # header=Noneで生データを読む
+            raw_lines = []
+            for _ in range(10):
+                line = uploaded_file.readline()
+                if not line: break
+                try:
+                    raw_lines.append(line.decode(enc).strip())
+                except:
+                    pass
             
-            # 形式判定
-            is_format_1 = False
-            is_format_2 = False
+            full_text = "\n".join(raw_lines)
             
-            # Format 1 (リスト): 「納品日」または「発注日」があり、「商品コード」または「JAN」がある
-            if ("納品日" in cols_str or "発注日" in cols_str) and \
-               ("商品コード" in cols_str or "JAN" in cols_str):
-                is_format_1 = True
+            # --- 形式判定 ---
+            
+            # Format 1: 1行目にヘッダーがあるリスト形式
+            # 特徴: 「納品日」や「発注日」があり、かつ「商品コード」や「JAN」がある
+            if ("納品日" in full_text or "発注日" in full_text) and \
+               ("商品コード" in full_text or "JAN" in full_text) and \
+               ("数量" in full_text or "売価" in full_text):
                 
-            # Format 2 (マトリックス): 「JANコード」と「部門」があり、データ部分が横に広がる
-            elif ("JAN" in cols_str or "商品コード" in cols_str) and "部門" in cols_str:
-                # Format 1と誤認しないよう、週合計などのキーワードもあればFormat 2優先
-                is_format_2 = True
-            
-            uploaded_file.seek(0)
-            
-            if is_format_1:
-                df = pd.read_csv(uploaded_file, encoding=enc, on_bad_lines='skip', dtype=str)
+                uploaded_file.seek(0)
+                # ヘッダー位置を探す（簡易的）
+                header_row = 0
+                for i, line in enumerate(raw_lines):
+                    if "商品コード" in line or "JAN" in line:
+                        header_row = i
+                        break
+                
+                df = pd.read_csv(uploaded_file, header=header_row, encoding=enc, on_bad_lines='skip', dtype=str)
                 processed = process_format_1(df)
                 if not processed.empty: return processed
+
+            # Format 2: マトリックス形式
+            # 特徴: 「JANコード」と「部門」が同じ行にあり、日付のようなヘッダーがある
+            # ヘッダーが2行にまたがる
+            elif ("JAN" in full_text or "商品コード" in full_text) and "部門" in full_text:
                 
-            elif is_format_2:
-                # マトリックスはヘッダーが2行の可能性が高い
-                df = pd.read_csv(uploaded_file, header=[0, 1], encoding=enc, on_bad_lines='skip', dtype=str)
-                processed = process_format_2_from_df(df)
+                # 年の取得 (メタデータ行にある場合: 対象期間：2026/01/21...)
+                year_hint = None
+                m_year = re.search(r'20\d{2}', full_text)
+                if m_year:
+                    year_hint = int(m_year.group(0))
+                
+                # ヘッダー行の特定
+                header_row_idx = 0
+                for i, line in enumerate(raw_lines):
+                    if ("JAN" in line or "商品コード" in line) and "部門" in line:
+                        header_row_idx = i
+                        break
+                
+                uploaded_file.seek(0)
+                # ヘッダーが2行（header_row_idx と その次の行）と仮定
+                df = pd.read_csv(uploaded_file, header=[header_row_idx, header_row_idx+1], encoding=enc, on_bad_lines='skip', dtype=str)
+                processed = process_format_2_from_df(df, year_hint=year_hint)
                 if not processed.empty: return processed
-                
-        except UnicodeDecodeError:
-            continue
+
         except Exception:
             continue
 
     return pd.DataFrame()
 
 # ---------------------------------------------------------
-# CSV生成・POP生成（ロジック維持）
+# CSV生成・POP生成 (変更なし)
 # ---------------------------------------------------------
 
 def create_matrix_csv(df: pd.DataFrame) -> bytes:
@@ -385,22 +413,21 @@ def main():
     <div class="line-warning">
         <h4>⚠️ LINEから開いている方へ</h4>
         <p><b>LINE内蔵ブラウザではアップロードが反応しない場合があります。</b><br>
-        反応しない場合は、他のブラウザで開いてください</p>
+        反応しない場合は、右上のメニュー（︙または↗️）から「ブラウザで開く」を選択してください。</p>
     </div>
     """, unsafe_allow_html=True)
 
     # ----------------------------------------
-    # 1. データ読込とフィルタ設定 (Expander)
+    # 1. データ読込とフィルタ設定
     # ----------------------------------------
     with st.expander("🛠️ データ読込・フィルタ設定", expanded=True):
-        st.caption("Step 1: データのアップロード")
+        st.caption("Step 1: データのアップロード (複数ファイル対応)")
         uploaded_files = st.file_uploader(
-            "CSV/TXTファイルをドロップ", 
+            "CSVファイルをドロップ", 
             type=["csv", "txt"], 
             accept_multiple_files=True
         )
         
-        # データロード処理
         all_data = []
         if uploaded_files:
             for f in uploaded_files:
@@ -411,7 +438,6 @@ def main():
                 else:
                     st.error(f"NG: {f.name} (形式不明またはデータなし)")
 
-        # データがある場合のみフィルタ項目を表示
         if all_data:
             master_df = pd.concat(all_data, ignore_index=True)
             master_df[COL_AMOUNT] = master_df[COL_QTY] * master_df[COL_PRICE]
@@ -419,7 +445,7 @@ def main():
             st.markdown("---")
             st.caption("Step 2: フィルタリング")
 
-            # 1. 期間設定
+            # 期間設定
             min_date = master_df[COL_DATE].min()
             max_date = master_df[COL_DATE].max()
             if pd.isna(min_date): min_date = datetime.date.today()
@@ -434,7 +460,7 @@ def main():
             )
             start_d, end_d = date_range
 
-            # 2. 部門設定
+            # 部門設定
             dept_options = sorted(master_df[COL_DEPT].unique())
             if 'selected_depts' not in st.session_state:
                 st.session_state.selected_depts = dept_options
@@ -444,7 +470,7 @@ def main():
             st.button("全部門を選択", on_click=select_all_depts, use_container_width=True)
             selected_depts = st.multiselect("部門を指定", dept_options, key="selected_depts")
 
-            # 3. 販促設定
+            # 販促設定
             unique_promos = sorted(list(set(master_df[COL_PROMO].astype(str).unique())))
             promo_options = [p for p in unique_promos if p.strip()]
             if "" in unique_promos or "nan" in unique_promos:
@@ -458,15 +484,15 @@ def main():
             st.button("全販促タイプを選択", on_click=select_all_promos, use_container_width=True)
             selected_promos = st.multiselect("販促タイプを指定", promo_options, key="selected_promos")
 
-            # 4. キーワード検索
+            # キーワード検索
             search_text = st.text_area("キーワード検索 (商品名・JAN)", height=68, placeholder="スペース区切りで複数可")
             
         else:
             st.info("まずはファイルをアップロードしてください👆")
-            st.stop() 
+            st.stop()
 
     # -------------------------------------------------
-    # フィルタロジック適用
+    # 結果表示
     # -------------------------------------------------
     mask = (
         (master_df[COL_DATE] >= start_d) & 
@@ -491,9 +517,7 @@ def main():
                 match_condition |= filtered_df[COL_NAME].astype(str).str.contains(k, na=False)
             filtered_df = filtered_df[match_condition]
 
-    # -------------------------------------------------
-    # 結果表示エリア
-    # -------------------------------------------------
+    # 集計
     agg_view = filtered_df.groupby(COL_JAN, as_index=False).agg({
         COL_DEPT: 'first', COL_NAME: 'first', COL_PRICE: 'max', 
         COL_QTY: 'sum', COL_AMOUNT: 'sum', COL_PROMO: 'first'
@@ -521,6 +545,7 @@ def main():
     st.markdown("---")
     st.subheader("📤 ダウンロード")
     
+    # ダウンロードボタン
     csv = create_matrix_csv(filtered_df)
     if csv:
         st.download_button(
