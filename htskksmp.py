@@ -13,7 +13,7 @@ st.set_page_config(
     page_title="発注データ集計アプリ",
     page_icon="📦",
     layout="wide",
-    initial_sidebar_state="collapsed" # サイドバーは基本的に使わないため閉じておく
+    initial_sidebar_state="collapsed"
 )
 
 # 統一フォーマットのカラム名定義
@@ -27,7 +27,7 @@ COL_PROMO = "promotion"
 COL_AMOUNT = "total_amount"
 
 # ---------------------------------------------------------
-# ユーティリティ関数（ロジック変更なし）
+# ユーティリティ関数
 # ---------------------------------------------------------
 
 def clean_jan(jan_val):
@@ -63,21 +63,45 @@ def parse_date_str(date_str, default_year=None):
     except: pass
     return None
 
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """カラム名の表記ゆれを統一する"""
+    col_map = {
+        '納品日': COL_DATE, '納品予定日': COL_DATE, '日付': COL_DATE,
+        '部門': COL_DEPT, '部門コード': COL_DEPT, '部門CD': COL_DEPT,
+        '商品コード': COL_JAN, 'JANコード': COL_JAN, 'JAN': COL_JAN, '商品CD': COL_JAN,
+        '商品名': COL_NAME, '品名': COL_NAME,
+        '発注数量': COL_QTY, '数量': COL_QTY, '発注数': COL_QTY,
+        '売単価': COL_PRICE, '単価': COL_PRICE, '原単価': COL_PRICE, '売価': COL_PRICE,
+        '発注区分': COL_PROMO, '販促': COL_PROMO, '特売': COL_PROMO
+    }
+    # カラム名を文字列にして空白削除してからマッピング確認
+    new_cols = {}
+    for c in df.columns:
+        c_str = str(c).strip()
+        if c_str in col_map:
+            new_cols[c] = col_map[c_str]
+    
+    return df.rename(columns=new_cols)
+
 # ---------------------------------------------------------
-# データ処理ロジック（ロジック変更なし）
+# データ処理ロジック
 # ---------------------------------------------------------
 
 def process_format_1(df: pd.DataFrame) -> pd.DataFrame:
     """ODR_RES形式 (トランザクション / 1行ヘッダー)"""
-    rename_map = {
-        '納品日': COL_DATE, '部門': COL_DEPT, '商品コード': COL_JAN,
-        '商品名': COL_NAME, '発注数量': COL_QTY, '売単価': COL_PRICE,
-        '発注区分': COL_PROMO
-    }
-    if not set(['納品日', '部門', '商品コード']).issubset(df.columns):
+    # カラム名を正規化して必須カラムがあるかチェック
+    df = normalize_columns(df)
+    
+    required_cols = {COL_DATE, COL_DEPT, COL_JAN}
+    if not required_cols.issubset(df.columns):
         return pd.DataFrame()
 
-    df = df.rename(columns=rename_map)
+    # 足りないカラムがあれば補完
+    if COL_NAME not in df.columns: df[COL_NAME] = ""
+    if COL_QTY not in df.columns: df[COL_QTY] = 0
+    if COL_PRICE not in df.columns: df[COL_PRICE] = 0
+    if COL_PROMO not in df.columns: df[COL_PROMO] = ""
+
     df[COL_DATE] = df[COL_DATE].apply(lambda x: parse_date_str(x))
     df[COL_DEPT] = df[COL_DEPT].apply(clean_dept)
     df[COL_JAN] = df[COL_JAN].apply(clean_jan)
@@ -141,66 +165,62 @@ def process_format_2_from_df(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 def load_data(uploaded_file) -> pd.DataFrame:
-    """ファイルの先頭をスキャンして自動判定読み込み"""
+    """
+    【スマホ対応強化版】
+    ファイルを最初にメモリに完全展開してから解析することで、
+    モバイルブラウザ特有のファイルポインタ消失やストリームエラーを防ぐ
+    """
     if uploaded_file is None: return pd.DataFrame()
     
-    start_row = 0
-    detected_enc = 'cp932'
-    format_type = None
-
+    # 1. ファイルポインタを先頭に戻す (スマホ対応で必須)
     uploaded_file.seek(0)
-    sample_bytes = uploaded_file.read(8192)
-    uploaded_file.seek(0)
-
-    for enc in ['utf-8', 'cp932']:
-        try:
-            text = sample_bytes.decode(enc)
-            lines = text.splitlines()
-            for i, line in enumerate(lines[:30]):
-                if "JANコード" in line and "部門" in line:
-                    start_row = i
-                    detected_enc = enc
-                    format_type = 2
-                    break
-                if "納品日" in line and "部門" in line:
-                    start_row = i
-                    detected_enc = enc
-                    format_type = 1
-                    break
-            if format_type: break
-        except UnicodeDecodeError:
-            continue
-
+    
+    # 2. ファイルの中身を全てメモリ(bytes)に読み込む
     try:
-        if format_type == 1:
-            df = pd.read_csv(uploaded_file, header=start_row, encoding=detected_enc)
-            return process_format_1(df)
-            
-        elif format_type == 2:
-            df = pd.read_csv(uploaded_file, header=[start_row, start_row+1], encoding=detected_enc)
-            return process_format_2_from_df(df)
-            
-        else:
-            uploaded_file.seek(0)
-            df_preview = pd.read_csv(uploaded_file, header=0, encoding='cp932', dtype=str, nrows=10)
-            cols_str = str(df_preview.columns) + str(df_preview.values)
-            
-            if "JANコード" in cols_str:
-                uploaded_file.seek(0)
-                df = pd.read_csv(uploaded_file, header=[0, 1], encoding='cp932')
-                return process_format_2_from_df(df)
-            elif "納品日" in cols_str:
-                uploaded_file.seek(0)
-                df = pd.read_csv(uploaded_file, header=0, encoding='cp932')
-                return process_format_1(df)
-                
+        file_content = uploaded_file.read()
     except Exception:
-        pass
-        
+        return pd.DataFrame()
+
+    # 3. 試行パターン定義
+    encodings = ['cp932', 'utf-8-sig', 'utf-8', 'shift_jis']
+    header_candidates = [0, 1, 2, 3, 4]
+
+    # 4. メモリ上のデータに対して総当たり解析
+    for enc in encodings:
+        for header_row in header_candidates:
+            try:
+                # 毎回新しいBytesIOストリームを作成する（ポインタ干渉を防ぐため）
+                stream = BytesIO(file_content)
+                
+                # --- パターン1: 通常のCSV (Format 1) ---
+                try:
+                    df = pd.read_csv(stream, header=header_row, encoding=enc, encoding_errors='replace')
+                    temp_df = normalize_columns(df)
+                    # 必須カラムが含まれているかチェック
+                    if {COL_DATE, COL_DEPT, COL_JAN}.issubset(temp_df.columns):
+                        return process_format_1(df)
+                except Exception:
+                    pass 
+
+                # --- パターン2: マトリックスCSV (Format 2) ---
+                stream.seek(0) # ストリーム位置リセット
+                try:
+                    df_matrix = pd.read_csv(stream, header=[header_row, header_row+1], encoding=enc, encoding_errors='replace')
+                    cols_str = str(df_matrix.columns)
+                    if ("JAN" in cols_str or "商品" in cols_str) and ("部門" in cols_str):
+                        res = process_format_2_from_df(df_matrix)
+                        if not res.empty: return res
+                except Exception:
+                    pass
+
+            except Exception:
+                continue 
+
+    # 全パターン失敗
     return pd.DataFrame()
 
 # ---------------------------------------------------------
-# CSV生成・POP生成（ロジック変更なし）
+# CSV生成・POP生成
 # ---------------------------------------------------------
 
 def create_matrix_csv(df: pd.DataFrame) -> bytes:
@@ -304,7 +324,7 @@ def create_pop_zip(agg_df, raw_df, start_date) -> bytes:
     return zip_buffer.getvalue()
 
 # ---------------------------------------------------------
-# アプリケーション本体（モバイルUIへリファクタリング）
+# アプリケーション本体
 # ---------------------------------------------------------
 
 def main():
@@ -352,7 +372,7 @@ def main():
                     all_data.append(df)
                     st.success(f"OK: {f.name} ({len(df)}行)")
                 else:
-                    st.error(f"NG: {f.name}")
+                    st.error(f"NG: {f.name} (読み込めませんでした)")
 
         # データがある場合のみフィルタ項目を表示
         if all_data:
@@ -377,7 +397,7 @@ def main():
             )
             start_d, end_d = date_range
 
-            # 2. 部門設定 (スマホ向けにレイアウト調整)
+            # 2. 部門設定
             dept_options = sorted(master_df[COL_DEPT].unique())
             if 'selected_depts' not in st.session_state:
                 st.session_state.selected_depts = dept_options
@@ -444,7 +464,7 @@ def main():
 
     st.subheader("📊 集計結果")
 
-    # メトリクス表示 (スマホは縦積みまたは2列が見やすい)
+    # メトリクス表示
     m1, m2, m3 = st.columns(3)
     m1.metric("合計金額", f"¥{agg_view[COL_AMOUNT].sum():,.0f}")
     m2.metric("総数量", f"{agg_view[COL_QTY].sum():,.0f}")
@@ -463,7 +483,7 @@ def main():
         use_container_width=True, hide_index=True, height=300
     )
 
-    # ダウンロードボタンエリア (大きく表示)
+    # ダウンロードボタンエリア
     st.markdown("---")
     st.subheader("📤 ダウンロード")
     
@@ -474,7 +494,7 @@ def main():
             data=csv,
             file_name=f"Order_{datetime.datetime.now():%Y%m%d}.csv",
             mime="text/csv",
-            use_container_width=True # 幅いっぱいにする
+            use_container_width=True
         )
     
     if not agg_view.empty:
@@ -484,8 +504,8 @@ def main():
             data=pop,
             file_name=f"POP_{datetime.datetime.now():%Y%m%d}.zip",
             mime="application/zip",
-            type="primary", # 色をつけて目立たせる
-            use_container_width=True # 幅いっぱいにする
+            type="primary",
+            use_container_width=True
         )
 
 if __name__ == "__main__":
