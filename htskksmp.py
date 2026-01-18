@@ -177,16 +177,14 @@ def process_format_2_from_df(df: pd.DataFrame, year_hint=None) -> pd.DataFrame:
             date_obj = parse_date_str(date_str, default_year=year_hint)
             if not date_obj: continue
 
-            # この日付の下にある「数量」「売価」「販促」を取得
-            # カラム名が ('01/21(水)', '数量') のようになっていると仮定
+            # マトリックスデータの取得
             try:
                 # 数量
                 qty_val = row.get((date_str, '数量'))
-                # マトリックス形式では空欄は0または発注なしとみなす
                 if pd.isna(qty_val): continue
                 
                 qty = pd.to_numeric(qty_val, errors='coerce')
-                if pd.isna(qty) or qty == 0: continue # 0もスキップ設定（必要なら変更）
+                if pd.isna(qty) or qty == 0: continue 
 
                 # 売価・販促
                 price = pd.to_numeric(row.get((date_str, '売価'), 0), errors='coerce')
@@ -210,9 +208,7 @@ def process_format_2_from_df(df: pd.DataFrame, year_hint=None) -> pd.DataFrame:
 
 def load_data(uploaded_file) -> pd.DataFrame:
     """
-    ロバストな読み込み関数
-    - 複数のエンコーディングを試行
-    - 形式（リスト or マトリックス）を自動判定
+    形式判定ロジック強化版
     """
     if uploaded_file is None: return pd.DataFrame()
     
@@ -222,10 +218,8 @@ def load_data(uploaded_file) -> pd.DataFrame:
         uploaded_file.seek(0)
         try:
             # 先頭の数行を読んで構造を解析
-            # on_bad_lines='skip' でパースエラーを無視してとにかく読む
-            # header=Noneで生データを読む
             raw_lines = []
-            for _ in range(10):
+            for _ in range(15):
                 line = uploaded_file.readline()
                 if not line: break
                 try:
@@ -233,48 +227,48 @@ def load_data(uploaded_file) -> pd.DataFrame:
                 except:
                     pass
             
+            if not raw_lines: continue
+            
             full_text = "\n".join(raw_lines)
             
-            # --- 形式判定 ---
+            # --- ヘッダー行と形式の特定 ---
+            header_row_idx = -1
+            is_matrix_format = False
             
-            # Format 1: 1行目にヘッダーがあるリスト形式
-            # 特徴: 「納品日」や「発注日」があり、かつ「商品コード」や「JAN」がある
-            if ("納品日" in full_text or "発注日" in full_text) and \
-               ("商品コード" in full_text or "JAN" in full_text) and \
-               ("数量" in full_text or "売価" in full_text):
-                
-                uploaded_file.seek(0)
-                # ヘッダー位置を探す（簡易的）
-                header_row = 0
-                for i, line in enumerate(raw_lines):
-                    if "商品コード" in line or "JAN" in line:
-                        header_row = i
-                        break
-                
-                df = pd.read_csv(uploaded_file, header=header_row, encoding=enc, on_bad_lines='skip', dtype=str)
+            for i, line in enumerate(raw_lines):
+                # 「部門」と「JAN」(または商品コード) がある行をヘッダーとみなす
+                if "部門" in line and ("JAN" in line or "商品コード" in line):
+                    header_row_idx = i
+                    
+                    # 形式の分岐: ヘッダー行に「納品日」や「発注日」があればリスト形式(Format1)
+                    if "納品日" in line or "発注日" in line:
+                        is_matrix_format = False
+                    # なければマトリックス形式(Format2)とみなす
+                    else:
+                        is_matrix_format = True
+                    break
+            
+            # ヘッダーが見つからなかった場合、次へ
+            if header_row_idx == -1: continue
+
+            # --- 読み込み実行 ---
+            uploaded_file.seek(0)
+            
+            if not is_matrix_format:
+                # Format 1 (ODR_RES)
+                df = pd.read_csv(uploaded_file, header=header_row_idx, encoding=enc, on_bad_lines='skip', dtype=str)
                 processed = process_format_1(df)
                 if not processed.empty: return processed
 
-            # Format 2: マトリックス形式
-            # 特徴: 「JANコード」と「部門」が同じ行にあり、日付のようなヘッダーがある
-            # ヘッダーが2行にまたがる
-            elif ("JAN" in full_text or "商品コード" in full_text) and "部門" in full_text:
-                
-                # 年の取得 (メタデータ行にある場合: 対象期間：2026/01/21...)
+            else:
+                # Format 2 (OrderCheckList)
+                # 年号の抽出 (メタデータ行から 20xx を探す)
                 year_hint = None
                 m_year = re.search(r'20\d{2}', full_text)
                 if m_year:
                     year_hint = int(m_year.group(0))
                 
-                # ヘッダー行の特定
-                header_row_idx = 0
-                for i, line in enumerate(raw_lines):
-                    if ("JAN" in line or "商品コード" in line) and "部門" in line:
-                        header_row_idx = i
-                        break
-                
-                uploaded_file.seek(0)
-                # ヘッダーが2行（header_row_idx と その次の行）と仮定
+                # ヘッダーは2行分として読み込む
                 df = pd.read_csv(uploaded_file, header=[header_row_idx, header_row_idx+1], encoding=enc, on_bad_lines='skip', dtype=str)
                 processed = process_format_2_from_df(df, year_hint=year_hint)
                 if not processed.empty: return processed
@@ -285,7 +279,7 @@ def load_data(uploaded_file) -> pd.DataFrame:
     return pd.DataFrame()
 
 # ---------------------------------------------------------
-# CSV生成・POP生成 (変更なし)
+# CSV生成・POP生成
 # ---------------------------------------------------------
 
 def create_matrix_csv(df: pd.DataFrame) -> bytes:
@@ -421,7 +415,7 @@ def main():
     # 1. データ読込とフィルタ設定
     # ----------------------------------------
     with st.expander("🛠️ データ読込・フィルタ設定", expanded=True):
-        st.caption("Step 1: データのアップロード (複数ファイル対応)")
+        st.caption("Step 1: データのアップロード")
         uploaded_files = st.file_uploader(
             "CSVファイルをドロップ", 
             type=["csv", "txt"], 
@@ -545,7 +539,6 @@ def main():
     st.markdown("---")
     st.subheader("📤 ダウンロード")
     
-    # ダウンロードボタン
     csv = create_matrix_csv(filtered_df)
     if csv:
         st.download_button(
